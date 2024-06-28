@@ -164,20 +164,25 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
         StringRedisTemplate stringRedisTemplate = (StringRedisTemplate) distributedCache.getInstance();
         // 列车查询逻辑较为复杂，详细解析文章查看 https://nageoffer.com/12306/question
         // v1 版本存在严重的性能深渊问题，v2 版本完美的解决了该问题。通过 Jmeter 压测聚合报告得知，性能提升在 300% - 500%+
+        // 加载城市数据，通过批量查询方式获取出发站点和到达站点对应的城市集合
         List<Object> stationDetails = stringRedisTemplate.opsForHash()
                 .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(requestParam.getFromStation(), requestParam.getToStation()));
         long count = stationDetails.stream().filter(Objects::isNull).count();
         if (count > 0) {
+            // 避免缓存击穿，通过分布式锁方式解决该问题
             RLock lock = redissonClient.getLock(LOCK_REGION_TRAIN_STATION_MAPPING);
             lock.lock();
             try {
+                // 双重判定锁，规避数据库无效请求
                 stationDetails = stringRedisTemplate.opsForHash()
                         .multiGet(REGION_TRAIN_STATION_MAPPING, Lists.newArrayList(requestParam.getFromStation(), requestParam.getToStation()));
                 count = stationDetails.stream().filter(Objects::isNull).count();
                 if (count > 0) {
+                    // 查询列车站点数据与城市信息
                     List<StationDO> stationDOList = stationMapper.selectList(Wrappers.emptyWrapper());
                     Map<String, String> regionTrainStationMap = new HashMap<>();
                     stationDOList.forEach(each -> regionTrainStationMap.put(each.getCode(), each.getRegionName()));
+                    // 通过 putAll 批量保存方式存入 Redis，避免多次 put 网络 IO 消耗
                     stringRedisTemplate.opsForHash().putAll(REGION_TRAIN_STATION_MAPPING, regionTrainStationMap);
                     stationDetails = new ArrayList<>();
                     stationDetails.add(regionTrainStationMap.get(requestParam.getFromStation()));
@@ -187,10 +192,14 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                 lock.unlock();
             }
         }
+        // 查询列车站点信息
         List<TicketListDTO> seatResults = new ArrayList<>();
+        // 构建查询 Redis 中 Hash 结构 Key，Key前缀 + 出发城市 + 到达城市
         String buildRegionTrainStationHashKey = String.format(REGION_TRAIN_STATION, stationDetails.get(0), stationDetails.get(1));
         Map<Object, Object> regionTrainStationAllMap = stringRedisTemplate.opsForHash().entries(buildRegionTrainStationHashKey);
+        // 如果为空，兜底查询数据库再放入缓存
         if (MapUtil.isEmpty(regionTrainStationAllMap)) {
+            // 老规矩上分布式锁
             RLock lock = redissonClient.getLock(LOCK_REGION_TRAIN_STATION);
             lock.lock();
             try {
@@ -239,7 +248,11 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
                 ? regionTrainStationAllMap.values().stream().map(each -> JSON.parseObject(each.toString(), TicketListDTO.class)).toList()
                 : seatResults;
         seatResults = seatResults.stream().sorted(new TimeStringComparator()).toList();
+        // 查询列车余票信息
         for (TicketListDTO each : seatResults) {
+            // 加载列车对应的座位价格数据
+            // safeGet 就是安全获取缓存方案，底层加了分布式锁和双重判定锁
+            // 如果查询 TRAIN_STATION_PRICE 数据为空，则加载数据库，并放入缓存
             String trainStationPriceStr = distributedCache.safeGet(
                     String.format(TRAIN_STATION_PRICE, each.getTrainId(), each.getDeparture(), each.getArrival()),
                     String.class,
